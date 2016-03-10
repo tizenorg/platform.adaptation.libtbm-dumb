@@ -1859,7 +1859,7 @@ init_tbm_bufmgr_priv (tbm_bufmgr bufmgr, int fd)
     }
     else
     {
-        bufmgr_backend->flags = 0;
+        bufmgr_backend->flags = (TBM_LOCK_CTRL_BACKEND | TBM_CACHE_CTRL_BACKEND);;
         bufmgr_backend->bo_lock = NULL;
         bufmgr_backend->bo_unlock = NULL;
     }
