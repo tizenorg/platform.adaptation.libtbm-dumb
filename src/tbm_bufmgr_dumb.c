@@ -947,6 +947,9 @@ tbm_dumb_bo_lock(tbm_bo bo, int device, int opt)
     bufmgr_dumb = (tbm_bufmgr_dumb)tbm_backend_get_bufmgr_priv(bo);
     DUMB_RETURN_VAL_IF_FAIL (bufmgr_dumb!=NULL, 0);
 
+    if (!bufmgr_dumb->use_dma_fence)
+       return 1;
+
     memset(&fence, 0, sizeof(struct dma_buf_fence));
 
     /* Check if the given type is valid or not. */
@@ -1047,6 +1050,12 @@ tbm_dumb_bo_unlock(tbm_bo bo)
 
     bo_dumb = (tbm_bo_dumb)tbm_backend_get_bo_priv(bo);
     DUMB_RETURN_VAL_IF_FAIL (bo_dumb!=NULL, 0);
+
+    bufmgr_dumb = (tbm_bufmgr_dumb)tbm_backend_get_bufmgr_priv(bo);
+    DUMB_RETURN_VAL_IF_FAIL (bufmgr_dumb!=NULL, 0);
+
+    if (!bufmgr_dumb->use_dma_fence)
+       return 1;
 
     if (bo_dumb->dma_fence[0].type & DMA_BUF_ACCESS_DMA)
         dma_type = 1;
@@ -1850,19 +1859,10 @@ init_tbm_bufmgr_priv (tbm_bufmgr bufmgr, int fd)
     bufmgr_backend->surface_get_num_bos = tbm_dumb_surface_get_num_bos;
     bufmgr_backend->bo_get_flags = tbm_dumb_bo_get_flags;
 
-    if (bufmgr_dumb->use_dma_fence)
-    {
-        bufmgr_backend->flags = (TBM_LOCK_CTRL_BACKEND | TBM_CACHE_CTRL_BACKEND);
-        bufmgr_backend->bo_lock = NULL;
-        bufmgr_backend->bo_lock2 = tbm_dumb_bo_lock;
-        bufmgr_backend->bo_unlock = tbm_dumb_bo_unlock;
-    }
-    else
-    {
-        bufmgr_backend->flags = (TBM_LOCK_CTRL_BACKEND | TBM_CACHE_CTRL_BACKEND);
-        bufmgr_backend->bo_lock = NULL;
-        bufmgr_backend->bo_unlock = NULL;
-    }
+    bufmgr_backend->flags = (TBM_LOCK_CTRL_BACKEND | TBM_CACHE_CTRL_BACKEND);
+    bufmgr_backend->bo_lock = NULL;
+    bufmgr_backend->bo_lock2 = tbm_dumb_bo_lock;
+    bufmgr_backend->bo_unlock = tbm_dumb_bo_unlock;
 
     if (!tbm_backend_init (bufmgr, bufmgr_backend))
     {
