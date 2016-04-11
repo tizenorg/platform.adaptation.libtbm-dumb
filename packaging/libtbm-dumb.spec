@@ -12,7 +12,7 @@ BuildRequires:  pkgconfig(pthread-stubs)
 BuildRequires:  pkgconfig(libdrm)
 BuildRequires:  pkgconfig(libtbm)
 BuildRequires:  pkgconfig(dlog)
-BuildRequires:  pkgconfig(wayland-client)
+BuildRequires:  pkgconfig(libudev)
 
 %description
 descriptionion: Tizen Buffer manager backend module uses drm dumb

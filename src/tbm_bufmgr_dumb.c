@@ -49,7 +49,8 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <pthread.h>
 #include <tbm_surface.h>
 #include <tbm_surface_internal.h>
-#include "tbm_wayland.h"
+#include <libudev.h>
+#include <tbm_drm_helper.h>
 
 #define DEBUG
 #define USE_DMAIMPORT
@@ -156,6 +157,7 @@ typedef struct _tbm_bo_dumb *tbm_bo_dumb;
 typedef struct _dumb_private
 {
     int ref_count;
+    struct _tbm_bo_dumb *bo_priv;
 } PrivGem;
 
 /* tbm buffor object for dumb */
@@ -192,7 +194,8 @@ struct _tbm_bufmgr_dumb
 
     int use_dma_fence;
 
-    int fd_owner;
+    char *device_name;
+    void *bind_display;
 };
 
 char *STR_DEVICE[]=
@@ -222,6 +225,86 @@ uint32_t tbm_dumb_color_format_list[TBM_COLOR_FORMAT_COUNT] = {   TBM_FORMAT_RGB
                                                                         TBM_FORMAT_YUV420,
                                                                         TBM_FORMAT_YVU420 };
 
+static int
+_tbm_dumb_open_drm()
+{ 
+    struct udev *udev = NULL;
+    struct udev_enumerate *e = NULL;
+    struct udev_list_entry *entry = NULL;
+    struct udev_device *device = NULL, *drm_device = NULL, *pci = NULL;
+    const char *filepath, *id;
+    struct stat s;
+    int fd = -1;
+    int ret;
+
+    udev = udev_new();
+    if (!udev) {
+        TBM_DUMB_LOG("udev_new() failed.\n");
+        return -1;
+    }
+
+    e = udev_enumerate_new(udev);
+    udev_enumerate_add_match_subsystem(e, "drm");
+    udev_enumerate_add_match_sysname(e, "card[0-9]*");
+    udev_enumerate_scan_devices(e);
+
+    drm_device = NULL;
+    udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e)) {
+        filepath = udev_list_entry_get_name(entry);
+        device = udev_device_new_from_syspath(udev, filepath);
+        if (!device)
+            continue;
+        
+        pci = udev_device_get_parent_with_subsystem_devtype(device, "pci", NULL);
+        if (pci) {
+            id = udev_device_get_sysattr_value(pci, "boot_vga");
+            if (id && !strcmp(id, "1")) {
+                if (drm_device)
+                udev_device_unref(drm_device);
+                drm_device = device;
+                break;
+            }
+        }
+        
+        if (!drm_device)
+            drm_device = device;
+        else
+            udev_device_unref(device);
+    }
+    
+    udev_enumerate_unref(e);
+
+    /* Get device file path. */
+    filepath = udev_device_get_devnode(drm_device);
+    if (!filepath) {
+        TBM_DUMB_LOG("udev_device_get_devnode() failed.\n");
+        udev_device_unref(drm_device);
+        udev_unref(udev);
+        return -1;
+    }
+
+    /* Open DRM device file and check validity. */
+    fd = open(filepath, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        TBM_DUMB_LOG("open(%s, O_RDWR | O_CLOEXEC) failed.\n");
+        udev_device_unref(drm_device);
+        udev_unref(udev);
+        return -1;
+    }
+
+    ret = fstat(fd, &s);
+    if (ret) {
+        TBM_DUMB_LOG("fstat() failed %s.\n");
+        udev_device_unref(drm_device);
+        udev_unref(udev);
+        return -1;
+    }
+
+    udev_device_unref(drm_device);
+    udev_unref(udev);
+
+    return fd;
+}
 
 static unsigned int
 _get_dumb_flag_from_tbm (unsigned int ftbm)
@@ -428,6 +511,7 @@ tbm_dumb_bo_alloc (tbm_bo bo, int size, int flags)
     }
 
     privGem->ref_count = 1;
+    privGem->bo_priv = bo_dumb;
     if (drmHashInsert(bufmgr_dumb->hashBos, bo_dumb->name, (void *)privGem) < 0)
     {
         TBM_DUMB_LOG ("error Cannot insert bo to Hash(%d)\n", bo_dumb->name);
@@ -520,9 +604,16 @@ tbm_dumb_bo_import (tbm_bo bo, unsigned int key)
 
     tbm_bufmgr_dumb bufmgr_dumb;
     tbm_bo_dumb bo_dumb;
+    PrivGem *privGem = NULL;
+    int ret;
 
     bufmgr_dumb = (tbm_bufmgr_dumb)tbm_backend_get_bufmgr_priv(bo);
     DUMB_RETURN_VAL_IF_FAIL (bufmgr_dumb!=NULL, 0);
+
+    ret = drmHashLookup (bufmgr_dumb->hashBos, key, (void **)&privGem);
+    if (ret == 0) {
+        return privGem->bo_priv;
+    }
 
     struct drm_gem_open arg = {0, };
 
@@ -562,32 +653,21 @@ tbm_dumb_bo_import (tbm_bo bo, unsigned int key)
     }
 
     /* add bo to hash */
-    PrivGem *privGem = NULL;
-    int ret;
-
-    ret = drmHashLookup (bufmgr_dumb->hashBos, bo_dumb->name, (void**)&privGem);
-    if (ret == 0)
+    privGem = NULL;
+    privGem = calloc (1, sizeof(PrivGem));
+    if (!privGem)
     {
-        privGem->ref_count++;
+        TBM_DUMB_LOG ("[libtbm-dumb:%d] "
+                "error %s:%d Fail to calloc privGem\n",
+                getpid(), __FUNCTION__, __LINE__);
+        free (bo_dumb);
+        return 0;
     }
-    else if (ret == 1)
-    {
-        privGem = calloc (1, sizeof(PrivGem));
-        if (!privGem)
-        {
-            TBM_DUMB_LOG ("error Fail to calloc privGem\n");
-            free (bo_dumb);
-            return 0;
-        }
 
-        privGem->ref_count = 1;
-        if (drmHashInsert (bufmgr_dumb->hashBos, bo_dumb->name, (void *)privGem) < 0)
-        {
-            TBM_DUMB_LOG ("error Cannot insert bo to Hash(%d)\n", bo_dumb->name);
-        }
-    }
-    else
-    {
+    privGem->ref_count = 1;
+    privGem->bo_priv = bo_dumb;
+
+    if (drmHashInsert (bufmgr_dumb->hashBos, bo_dumb->name, (void *)privGem) < 0) {
         TBM_DUMB_LOG ("error Cannot insert bo to Hash(%d)\n", bo_dumb->name);
     }
 
@@ -611,6 +691,9 @@ tbm_dumb_bo_import_fd (tbm_bo bo, tbm_fd key)
 
     bufmgr_dumb = (tbm_bufmgr_dumb)tbm_backend_get_bufmgr_priv(bo);
     DUMB_RETURN_VAL_IF_FAIL (bufmgr_dumb!=NULL, 0);
+
+    PrivGem *privGem = NULL;
+    int ret;
 
     unsigned int gem = 0;
     unsigned int name = 0;
@@ -643,7 +726,14 @@ tbm_dumb_bo_import_fd (tbm_bo bo, tbm_fd key)
         TBM_DUMB_LOG ("error bo:%p Cannot get name from gem:%d, fd:%d (%s)\n",
             bo, gem, key, strerror(errno));
         return 0;
-    }    
+    }
+
+    ret = drmHashLookup (bufmgr_dumb->hashBos, name, (void **)&privGem);
+    if (ret == 0) {
+        if (gem == privGem->bo_priv->gem) {
+            return privGem->bo_priv;
+        }
+    }
 
     /* Open the same GEM object only for finding out its size */
     gem_open.name = name;
@@ -680,35 +770,22 @@ tbm_dumb_bo_import_fd (tbm_bo bo, tbm_fd key)
     bo_dumb->name = name;
 
     /* add bo to hash */
-    PrivGem *privGem = NULL;
-    int ret;
-
-    ret = drmHashLookup (bufmgr_dumb->hashBos, bo_dumb->name, (void**)&privGem);
-    if (ret == 0)
+    privGem = NULL;
+    privGem = calloc (1, sizeof(PrivGem));
+    if (!privGem)
     {
-        privGem->ref_count++;
+        TBM_DUMB_LOG ("[libtbm-dumb:%d] "
+                "error %s:%d Fail to calloc privGem\n",
+                getpid(), __FUNCTION__, __LINE__);
+        free (bo_dumb);
+        return 0;
     }
-    else if (ret == 1)
-    {
-        privGem = calloc (1, sizeof(PrivGem));
-        if (!privGem)
-        {
-            TBM_DUMB_LOG ("error Fail to calloc privGem\n");
-            free (bo_dumb);
-            return 0;
-        }
 
-        privGem->ref_count = 1;
-        if (drmHashInsert (bufmgr_dumb->hashBos, bo_dumb->name, (void *)privGem) < 0)
-        {
-            TBM_DUMB_LOG ("error bo:%p Cannot insert bo to Hash(%d) from gem:%d, fd:%d\n",
-                bo, bo_dumb->name, gem, key);
-        }
-    }
-    else
-    {
-        TBM_DUMB_LOG ("error bo:%p Cannot insert bo to Hash(%d) from gem:%d, fd:%d\n",
-                bo, bo_dumb->name, gem, key);
+    privGem->ref_count = 1;
+    privGem->bo_priv = bo_dumb;
+
+    if (drmHashInsert (bufmgr_dumb->hashBos, bo_dumb->name, (void *)privGem) < 0) {
+        TBM_DUMB_LOG ("error Cannot insert bo to Hash(%d)\n", bo_dumb->name);
     }
 
     DBG (" [%s] bo:%p, gem:%d(%d), fd:%d, key_fd:%d, flags:%d(%d), size:%d\n", target_name(),
@@ -875,52 +952,6 @@ tbm_dumb_bo_unmap (tbm_bo bo)
           bo_dumb->dmabuf);
 
     return 1;
-}
-
-static int
-tbm_dumb_bo_cache_flush (tbm_bo bo, int flags)
-{
-    tbm_bufmgr_dumb bufmgr_dumb = (tbm_bufmgr_dumb)tbm_backend_get_bufmgr_priv(bo);
-    DUMB_RETURN_VAL_IF_FAIL (bufmgr_dumb!=NULL, 0);
-
-    /* cache flush is managed by kernel side when using dma-fence. */
-    if (bufmgr_dumb->use_dma_fence)
-       return 1;
-
-    DUMB_RETURN_VAL_IF_FAIL (bo!=NULL, 0);
-
-    tbm_bo_dumb bo_dumb;
-
-    bo_dumb = (tbm_bo_dumb)tbm_backend_get_bo_priv(bo);
-    DUMB_RETURN_VAL_IF_FAIL (bo_dumb!=NULL, 0);
-
-#ifdef USE_CACHE
-    if (!_dumb_cache_flush(bo_dumb->fd, bo_dumb, flags))
-        return 0;
-#endif
-
-    return 1;
-}
-
-static int
-tbm_dumb_bo_get_global_key (tbm_bo bo)
-{
-    DUMB_RETURN_VAL_IF_FAIL (bo!=NULL, 0);
-
-    tbm_bo_dumb bo_dumb;
-
-    bo_dumb = (tbm_bo_dumb)tbm_backend_get_bo_priv(bo);
-    DUMB_RETURN_VAL_IF_FAIL (bo_dumb!=NULL, 0);
-
-    if (!bo_dumb->name)
-    {
-        if (!bo_dumb->gem)
-            return 0;
-
-        bo_dumb->name = _get_name(bo_dumb->fd, bo_dumb->gem);
-    }
-
-    return bo_dumb->name;
 }
 
 static int
@@ -1144,8 +1175,16 @@ tbm_dumb_bufmgr_deinit (void *priv)
         bufmgr_dumb->hashBos = NULL;
     }
 
-    if (bufmgr_dumb->fd_owner)
-        close (bufmgr_dumb->fd);
+    if (bufmgr_dumb->bind_display)
+        tbm_drm_helper_wl_auth_server_deinit();
+
+    if (bufmgr_dumb->device_name)
+        free(bufmgr_dumb->device_name);
+
+    if (tbm_backend_is_display_server())
+        tbm_drm_helper_unset_tbm_master_fd();
+
+    close(bufmgr_dumb->fd);
 
     free (bufmgr_dumb);
 }
@@ -1173,7 +1212,6 @@ tbm_dumb_surface_supported_format(uint32_t **formats, uint32_t *num)
 
 /**
  * @brief get the plane data of the surface.
- * @param[in] surface : the surface
  * @param[in] width : the width of the surface
  * @param[in] height : the height of the surface
  * @param[in] format : the format of the surface
@@ -1185,7 +1223,7 @@ tbm_dumb_surface_supported_format(uint32_t **formats, uint32_t *num)
  * @return 1 if this function succeeds, otherwise 0.
  */
 int
-tbm_dumb_surface_get_plane_data(tbm_surface_h surface, int width, int height, tbm_format format, int plane_idx, uint32_t *size, uint32_t *offset, uint32_t *pitch, int *bo_idx)
+tbm_dumb_surface_get_plane_data(int width, int height, tbm_format format, int plane_idx, uint32_t *size, uint32_t *offset, uint32_t *pitch, int *bo_idx)
 {
     int ret = 1;
     int bpp;
@@ -1425,326 +1463,6 @@ tbm_dumb_surface_get_plane_data(tbm_surface_h surface, int width, int height, tb
 }
 
 int
-tbm_dumb_surface_get_num_bos(tbm_format format)
-{
-    int num = 0;
-
-    switch(format)
-    {
-        /* 16 bpp RGB */
-        case TBM_FORMAT_XRGB4444:
-        case TBM_FORMAT_XBGR4444:
-        case TBM_FORMAT_RGBX4444:
-        case TBM_FORMAT_BGRX4444:
-        case TBM_FORMAT_ARGB4444:
-        case TBM_FORMAT_ABGR4444:
-        case TBM_FORMAT_RGBA4444:
-        case TBM_FORMAT_BGRA4444:
-        case TBM_FORMAT_XRGB1555:
-        case TBM_FORMAT_XBGR1555:
-        case TBM_FORMAT_RGBX5551:
-        case TBM_FORMAT_BGRX5551:
-        case TBM_FORMAT_ARGB1555:
-        case TBM_FORMAT_ABGR1555:
-        case TBM_FORMAT_RGBA5551:
-        case TBM_FORMAT_BGRA5551:
-        case TBM_FORMAT_RGB565:
-        /* 24 bpp RGB */
-        case TBM_FORMAT_RGB888:
-        case TBM_FORMAT_BGR888:
-        /* 32 bpp RGB */
-        case TBM_FORMAT_XRGB8888:
-        case TBM_FORMAT_XBGR8888:
-        case TBM_FORMAT_RGBX8888:
-        case TBM_FORMAT_BGRX8888:
-        case TBM_FORMAT_ARGB8888:
-        case TBM_FORMAT_ABGR8888:
-        case TBM_FORMAT_RGBA8888:
-        case TBM_FORMAT_BGRA8888:
-        /* packed YCbCr */
-        case TBM_FORMAT_YUYV:
-        case TBM_FORMAT_YVYU:
-        case TBM_FORMAT_UYVY:
-        case TBM_FORMAT_VYUY:
-        case TBM_FORMAT_AYUV:
-        /*
-        * 2 plane YCbCr
-        * index 0 = Y plane, [7:0] Y
-        * index 1 = Cr:Cb plane, [15:0] Cr:Cb little endian
-        * or
-        * index 1 = Cb:Cr plane, [15:0] Cb:Cr little endian
-        */
-        case TBM_FORMAT_NV21:
-        case TBM_FORMAT_NV16:
-        case TBM_FORMAT_NV61:
-        /*
-        * 3 plane YCbCr
-        * index 0: Y plane, [7:0] Y
-        * index 1: Cb plane, [7:0] Cb
-        * index 2: Cr plane, [7:0] Cr
-        * or
-        * index 1: Cr plane, [7:0] Cr
-        * index 2: Cb plane, [7:0] Cb
-        */
-        case TBM_FORMAT_YUV410:
-        case TBM_FORMAT_YVU410:
-        case TBM_FORMAT_YUV411:
-        case TBM_FORMAT_YVU411:
-        case TBM_FORMAT_YUV420:
-        case TBM_FORMAT_YVU420:
-        case TBM_FORMAT_YUV422:
-        case TBM_FORMAT_YVU422:
-        case TBM_FORMAT_YUV444:
-        case TBM_FORMAT_YVU444:
-            num = 1;
-            break;
-
-        case TBM_FORMAT_NV12:
-            num = 2;
-            break;
-
-        default:
-            num = 0;
-            break;
-    }
-
-    return num;
-}
-
-/**
-* @brief get the size of the surface with a format.
-* @param[in] surface : the surface
-* @param[in] width : the width of the surface
-* @param[in] height : the height of the surface
-* @param[in] format : the format of the surface
-* @return size of the surface if this function succeeds, otherwise 0.
-*/
-
-int
-tbm_dumb_surface_get_size(tbm_surface_h surface, int width, int height, tbm_format format)
-{
-    int ret = 0;
-    int bpp = 0;
-    int _pitch =0;
-    int _size =0;
-    int align =TBM_SURFACE_ALIGNMENT_PLANE;
-
-    switch(format)
-    {
-        /* 16 bpp RGB */
-        case TBM_FORMAT_XRGB4444:
-        case TBM_FORMAT_XBGR4444:
-        case TBM_FORMAT_RGBX4444:
-        case TBM_FORMAT_BGRX4444:
-        case TBM_FORMAT_ARGB4444:
-        case TBM_FORMAT_ABGR4444:
-        case TBM_FORMAT_RGBA4444:
-        case TBM_FORMAT_BGRA4444:
-        case TBM_FORMAT_XRGB1555:
-        case TBM_FORMAT_XBGR1555:
-        case TBM_FORMAT_RGBX5551:
-        case TBM_FORMAT_BGRX5551:
-        case TBM_FORMAT_ARGB1555:
-        case TBM_FORMAT_ABGR1555:
-        case TBM_FORMAT_RGBA5551:
-        case TBM_FORMAT_BGRA5551:
-        case TBM_FORMAT_RGB565:
-            bpp = 16;
-            _pitch = SIZE_ALIGN((width*bpp)>>3,TBM_SURFACE_ALIGNMENT_PITCH_RGB);
-            _size = SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            break;
-        /* 24 bpp RGB */
-        case TBM_FORMAT_RGB888:
-        case TBM_FORMAT_BGR888:
-            bpp = 24;
-            _pitch = SIZE_ALIGN((width*bpp)>>3,TBM_SURFACE_ALIGNMENT_PITCH_RGB);
-            _size = SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            break;
-        /* 32 bpp RGB */
-        case TBM_FORMAT_XRGB8888:
-        case TBM_FORMAT_XBGR8888:
-        case TBM_FORMAT_RGBX8888:
-        case TBM_FORMAT_BGRX8888:
-        case TBM_FORMAT_ARGB8888:
-        case TBM_FORMAT_ABGR8888:
-        case TBM_FORMAT_RGBA8888:
-        case TBM_FORMAT_BGRA8888:
-            bpp = 32;
-            _pitch = SIZE_ALIGN((width*bpp)>>3,TBM_SURFACE_ALIGNMENT_PITCH_RGB);
-            _size = SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            break;
-        /* packed YCbCr */
-        case TBM_FORMAT_YUYV:
-        case TBM_FORMAT_YVYU:
-        case TBM_FORMAT_UYVY:
-        case TBM_FORMAT_VYUY:
-        case TBM_FORMAT_AYUV:
-            bpp = 32;
-            _pitch = SIZE_ALIGN((width*bpp)>>3,TBM_SURFACE_ALIGNMENT_PITCH_YUV);
-            _size = SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            break;
-        /*
-        * 2 plane YCbCr
-        * index 0 = Y plane, [7:0] Y
-        * index 1 = Cr:Cb plane, [15:0] Cr:Cb little endian
-        * or
-        * index 1 = Cb:Cr plane, [15:0] Cb:Cr little endian
-        */
-        case TBM_FORMAT_NV12:
-        case TBM_FORMAT_NV21:
-            bpp = 12;
-             //plane_idx == 0
-             {
-                 _pitch = SIZE_ALIGN( width ,TBM_SURFACE_ALIGNMENT_PITCH_YUV);
-                 _size = SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-             }
-             //plane_idx ==1
-             {
-                 _pitch = SIZE_ALIGN( width ,TBM_SURFACE_ALIGNMENT_PITCH_YUV/2);
-                 _size += SIZE_ALIGN(_pitch*(height/2),TBM_SURFACE_ALIGNMENT_PLANE);
-             }
-             break;
-
-            break;
-        case TBM_FORMAT_NV16:
-        case TBM_FORMAT_NV61:
-            bpp = 16;
-            //plane_idx == 0
-            {
-                _pitch = SIZE_ALIGN(width,TBM_SURFACE_ALIGNMENT_PITCH_YUV);
-                _size = SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            }
-            //plane_idx ==1
-            {
-                _pitch = SIZE_ALIGN(width,TBM_SURFACE_ALIGNMENT_PITCH_YUV/2);
-                _size += SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            }
-
-            break;
-        /*
-        * 3 plane YCbCr
-        * index 0: Y plane, [7:0] Y
-        * index 1: Cb plane, [7:0] Cb
-        * index 2: Cr plane, [7:0] Cr
-        * or
-        * index 1: Cr plane, [7:0] Cr
-        * index 2: Cb plane, [7:0] Cb
-        */
-        case TBM_FORMAT_YUV410:
-        case TBM_FORMAT_YVU410:
-            bpp = 9;
-        align = TBM_SURFACE_ALIGNMENT_PITCH_YUV;
-            break;
-        case TBM_FORMAT_YUV411:
-        case TBM_FORMAT_YVU411:
-        case TBM_FORMAT_YUV420:
-        case TBM_FORMAT_YVU420:
-            bpp = 12;
-            //plane_idx == 0
-            {
-                _pitch = SIZE_ALIGN(width,TBM_SURFACE_ALIGNMENT_PITCH_YUV);
-                _size = SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            }
-            //plane_idx == 1
-            {
-                _pitch = SIZE_ALIGN(width/2,TBM_SURFACE_ALIGNMENT_PITCH_YUV/2);
-                _size += SIZE_ALIGN(_pitch*(height/2),TBM_SURFACE_ALIGNMENT_PLANE);
-            }
-            //plane_idx == 2
-            {
-                _pitch = SIZE_ALIGN(width/2,TBM_SURFACE_ALIGNMENT_PITCH_YUV/2);
-                _size += SIZE_ALIGN(_pitch*(height/2),TBM_SURFACE_ALIGNMENT_PLANE);
-            }
-
-            break;
-        case TBM_FORMAT_YUV422:
-        case TBM_FORMAT_YVU422:
-            bpp = 16;
-            //plane_idx == 0
-            {
-                _pitch = SIZE_ALIGN(width,TBM_SURFACE_ALIGNMENT_PITCH_YUV);
-                _size = SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            }
-            //plane_idx == 1
-            {
-                _pitch = SIZE_ALIGN(width/2,TBM_SURFACE_ALIGNMENT_PITCH_YUV/2);
-                _size += SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            }
-            //plane_idx == 2
-            {
-                _pitch = SIZE_ALIGN(width/2,TBM_SURFACE_ALIGNMENT_PITCH_YUV/2);
-                _size += SIZE_ALIGN(_pitch*height,TBM_SURFACE_ALIGNMENT_PLANE);
-            }
-            break;
-        case TBM_FORMAT_YUV444:
-        case TBM_FORMAT_YVU444:
-            bpp = 24;
-            align = TBM_SURFACE_ALIGNMENT_PITCH_YUV;
-            break;
-
-        default:
-            bpp = 0;
-            break;
-    }
-
-    if(_size > 0)
-        ret = _size;
-    else
-        ret =  SIZE_ALIGN( (width * height * bpp) >> 3, align);
-
-    return ret;
-
-}
-
-tbm_bo_handle
-tbm_dumb_fd_to_handle(tbm_bufmgr bufmgr, tbm_fd fd, int device)
-{
-    DUMB_RETURN_VAL_IF_FAIL (bufmgr!=NULL, (tbm_bo_handle) NULL);
-    DUMB_RETURN_VAL_IF_FAIL (fd > 0, (tbm_bo_handle) NULL);
-
-    tbm_bo_handle bo_handle;
-    memset (&bo_handle, 0x0, sizeof (uint64_t));
-
-    tbm_bufmgr_dumb bufmgr_dumb = (tbm_bufmgr_dumb)tbm_backend_get_priv_from_bufmgr(bufmgr);
-
-    switch(device)
-    {
-    case TBM_DEVICE_DEFAULT:
-    case TBM_DEVICE_2D:
-    {
-        //getting handle from fd
-        struct drm_prime_handle arg = {0, };
-
-        arg.fd = fd;
-        arg.flags = 0;
-        if (drmIoctl (bufmgr_dumb->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &arg))
-        {
-            TBM_DUMB_LOG ("error Cannot get gem handle from fd:%d (%s)\n",
-                     arg.fd, strerror(errno));
-            return (tbm_bo_handle) NULL;
-        }
-
-        bo_handle.u32 = (uint32_t)arg.handle;;
-        break;
-    }
-    case TBM_DEVICE_CPU:
-        TBM_DUMB_LOG ("Not supported device:%d\n", device);
-        bo_handle.ptr = (void *) NULL;
-        break;
-    case TBM_DEVICE_3D:
-    case TBM_DEVICE_MM:
-        bo_handle.u32 = (uint32_t)fd;
-        break;
-    default:
-        TBM_DUMB_LOG ("error Not supported device:%d\n", device);
-        bo_handle.ptr = (void *) NULL;
-        break;
-    }
-
-    return bo_handle;
-}
-
-int
 tbm_dumb_bo_get_flags (tbm_bo bo)
 {
     DUMB_RETURN_VAL_IF_FAIL (bo != NULL, 0);
@@ -1755,6 +1473,25 @@ tbm_dumb_bo_get_flags (tbm_bo bo)
     DUMB_RETURN_VAL_IF_FAIL (bo_dumb != NULL, 0);
 
     return bo_dumb->flags_tbm;
+}
+
+int
+tbm_dumb_bufmgr_bind_native_display (tbm_bufmgr bufmgr, void *native_display)
+{
+    tbm_bufmgr_dumb bufmgr_dumb;
+    
+    bufmgr_dumb = tbm_backend_get_priv_from_bufmgr(bufmgr);
+    DUMB_RETURN_VAL_IF_FAIL(bufmgr_dumb != NULL, 0);
+    
+    if (!tbm_drm_helper_wl_auth_server_init(native_display, bufmgr_dumb->fd,
+                                            bufmgr_dumb->device_name, 0)) {
+        TBM_DUMB_LOG("error:Fail to tbm_drm_helper_wl_server_init\n");
+        return 0;
+    }
+    
+    bufmgr_dumb->bind_display = native_display;
+    
+    return 1;
 }
 
 MODULEINITPPROTO (init_tbm_bufmgr_priv);
@@ -1792,19 +1529,44 @@ init_tbm_bufmgr_priv (tbm_bufmgr bufmgr, int fd)
         return 0;
     }
 
-    if (fd < 0)
-    {
-        bufmgr_dumb->fd = tbm_bufmgr_get_drm_fd_wayland();
-        bufmgr_dumb->fd_owner = 1;
-    }
-    else
-        bufmgr_dumb->fd = fd;
+    if (tbm_backend_is_display_server()) {      
 
-    if (bufmgr_dumb->fd  < 0)
-    {
-        TBM_DUMB_LOG ("error: Fail to create drm!\n");
-        free (bufmgr_dumb);
-        return 0;
+        bufmgr_dumb->fd = tbm_drm_helper_get_master_fd();
+        if (bufmgr_dumb->fd < 0) {
+            bufmgr_dumb->fd = _tbm_dumb_open_drm();
+        }
+    
+        if (bufmgr_dumb->fd < 0) {
+            TBM_DUMB_LOG ("error:Fail to create drm!\n");
+            free (bufmgr_dumb);
+            return 0;
+        }
+
+		tbm_drm_helper_set_tbm_master_fd(bufmgr_dumb->fd);
+    
+        bufmgr_dumb->device_name = drmGetDeviceNameFromFd(bufmgr_dumb->fd);
+        
+        if (!bufmgr_dumb->device_name)
+        {
+            TBM_DUMB_LOG ("error:Fail to get device name!\n");
+    
+            tbm_drm_helper_unset_tbm_master_fd();
+
+            close(bufmgr_dumb->fd);
+    
+            free (bufmgr_dumb);
+            return 0;
+        }
+    } else {
+        if (!tbm_drm_helper_get_auth_info(&(bufmgr_dumb->fd), &(bufmgr_dumb->device_name), NULL)) {
+            TBM_DUMB_LOG ("error:Fail to get auth drm info!\n");
+
+            if (bufmgr_dumb->fd >= 0)
+    	        close(bufmgr_dumb->fd);
+
+            free (bufmgr_dumb);
+            return 0;
+        }
     }
 
     //Create Hash Table
@@ -1831,8 +1593,10 @@ init_tbm_bufmgr_priv (tbm_bufmgr bufmgr, int fd)
         if (bufmgr_dumb->hashBos)
             drmHashDestroy (bufmgr_dumb->hashBos);
 
-        if (bufmgr_dumb->fd_owner)
-            close(bufmgr_dumb->fd);
+        if (tbm_backend_is_display_server())
+            tbm_drm_helper_unset_tbm_master_fd();
+
+        close(bufmgr_dumb->fd);
 
         free (bufmgr_dumb);
         return 0;
@@ -1850,26 +1614,21 @@ init_tbm_bufmgr_priv (tbm_bufmgr bufmgr, int fd)
     bufmgr_backend->bo_get_handle = tbm_dumb_bo_get_handle,
     bufmgr_backend->bo_map = tbm_dumb_bo_map,
     bufmgr_backend->bo_unmap = tbm_dumb_bo_unmap,
-    bufmgr_backend->bo_cache_flush = tbm_dumb_bo_cache_flush,
-    bufmgr_backend->bo_get_global_key = tbm_dumb_bo_get_global_key;
     bufmgr_backend->surface_get_plane_data = tbm_dumb_surface_get_plane_data;
-    bufmgr_backend->surface_get_size = tbm_dumb_surface_get_size;
     bufmgr_backend->surface_supported_format = tbm_dumb_surface_supported_format;
-    bufmgr_backend->fd_to_handle = tbm_dumb_fd_to_handle;
-    bufmgr_backend->surface_get_num_bos = tbm_dumb_surface_get_num_bos;
     bufmgr_backend->bo_get_flags = tbm_dumb_bo_get_flags;
-
-    bufmgr_backend->flags = (TBM_LOCK_CTRL_BACKEND | TBM_CACHE_CTRL_BACKEND);
-    bufmgr_backend->bo_lock = NULL;
-    bufmgr_backend->bo_lock2 = tbm_dumb_bo_lock;
+    bufmgr_backend->bo_lock = tbm_dumb_bo_lock;
     bufmgr_backend->bo_unlock = tbm_dumb_bo_unlock;
+    bufmgr_backend->bufmgr_bind_native_display = tbm_dumb_bufmgr_bind_native_display;
 
     if (!tbm_backend_init (bufmgr, bufmgr_backend))
     {
         TBM_DUMB_LOG ("error: Fail to init backend!\n");
 
-        if (bufmgr_dumb->fd_owner)
-            close(bufmgr_dumb->fd);
+        if (tbm_backend_is_display_server())
+            tbm_drm_helper_unset_tbm_master_fd();
+
+        close(bufmgr_dumb->fd);
 
         tbm_backend_free (bufmgr_backend);
         free (bufmgr_dumb);
