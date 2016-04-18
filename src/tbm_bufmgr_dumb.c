@@ -295,6 +295,7 @@ _tbm_dumb_open_drm()
     ret = fstat(fd, &s);
     if (ret) {
         TBM_DUMB_LOG("fstat() failed %s.\n");
+        close(fd);
         udev_device_unref(drm_device);
         udev_unref(udev);
         return -1;
